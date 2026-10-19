@@ -1,0 +1,125 @@
+package fogsim;
+
+import java.util.*;
+import org.cloudbus.cloudsim.core.CloudSim;
+import org.cloudbus.cloudsim.core.SimEvent;
+import org.fog.entities.Actuator;
+import org.fog.entities.FogDevice;
+import org.fog.entities.Sensor;
+import org.fog.placement.Controller;
+import org.fog.utils.FogEvents;
+import org.fog.utils.FogUtils;
+
+/**
+ * Online per-task dispatcher on top of iFogSim2.
+ *
+ * iFogSim2 places application modules; it has no per-task offloading hook. This Controller subclass adds one:
+ * every task arrives at the gateway, the scheduler of fogsim.Scheduler (unchanged) picks a node, and the task is
+ * delivered to that node's FogDevice as a Tuple. The FogDevice then executes it with iFogSim2's own VM/cloudlet engine.
+ *
+ * Time unit. iFogSim2 treats the simulation clock as milliseconds (periodic events, minimum event spacing of 0.11,
+ * latencies in ms). The simulator of this study works in seconds, so every delay is multiplied by TS = 1000 and every
+ * task length by TS (a task of L MI on a lane of M MIPS then takes TS*L/M clock units = milliseconds).
+ *
+ * Queue discipline. FIFO (default, as in the study): a lane runs one task at a time; waiting tasks are held here and
+ * released to the FogDevice when the previous one finishes. PS: tuples go to the device immediately and share the
+ * device with iFogSim2's native TupleScheduler (processor sharing).
+ */
+final class IFogDispatcher extends Controller {
+    enum Queue { FIFO, PS }
+
+    static final double TS = 1000.0;   // clock units per second
+    static final double T0 = 1.0;      // seconds: modules are launched at t = 0, tasks start after T0
+    static final int TAG_DISPATCH = 91001, TAG_ARRIVE = 91002, TAG_DONE = 91003;
+
+    /** One FIFO lane = one FogDevice hosting one AppModule. */
+    static final class Lane {
+        final FogDevice dev; final String module; boolean busy;
+        final ArrayDeque<IFogTaskTuple> queue = new ArrayDeque<>();
+        Lane(FogDevice dev, String module) { this.dev = dev; this.module = module; }
+    }
+
+    final Node[] nodes; final Task[] tasks; final Scheduler sched; final Params p; final Random rng;
+    final Lane[][] lanes; final Queue qm; final String appId; final int brokerId;
+
+    // results collected on the way
+    final double[] resp; int completed, gated; double offSum, energy, lastFinish; long decNs; final int[] tierCnt = new int[3];
+
+    IFogDispatcher(List<FogDevice> devices, Node[] nodes, Task[] tasks, Scheduler sched, Params p, Random rng,
+                   Lane[][] lanes, Queue qm, String appId, int brokerId) {
+        super("dispatcher", devices, new ArrayList<Sensor>(), new ArrayList<Actuator>());
+        this.nodes = nodes; this.tasks = tasks; this.sched = sched; this.p = p; this.rng = rng;
+        this.lanes = lanes; this.qm = qm; this.appId = appId; this.brokerId = brokerId;
+        this.resp = new double[tasks.length];
+    }
+
+    @Override
+    public void startEntity() {
+        super.startEntity();   // submits the application: launches one module on every lane device at t = 0
+        for (int i = 0; i < tasks.length; i++) send(getId(), (T0 + tasks[i].t) * TS, TAG_DISPATCH, i);
+    }
+
+    @Override
+    public void processEvent(SimEvent ev) {
+        switch (ev.getTag()) {
+            case TAG_DISPATCH: dispatch((Integer) ev.getData()); break;
+            case TAG_ARRIVE:   arrive((IFogTaskTuple) ev.getData()); break;
+            case TAG_DONE:     done((IFogTaskTuple) ev.getData()); break;
+            case FogEvents.STOP_SIMULATION: break;   // the stock Controller would call System.exit(0) here
+            default: super.processEvent(ev);
+        }
+    }
+
+    /** Task reaches the gateway: decide, then ship it to the chosen node (uplink delay + input transfer). */
+    private void dispatch(int i) {
+        Task t = tasks[i];
+        long t0 = System.nanoTime();
+        Node v = sched.assign(t, nodes, t.t, rng, p);            // scheduler state is in seconds, as in the study
+        decNs += System.nanoTime() - t0;
+
+        boolean gateOn = t.u >= p.ucrit;
+        if (gateOn) gated++;
+        int lane = (sched.gate() && gateOn && v.resFrac > 0) ? 1 : 0;
+        double exe = t.L / v.rate(lane);
+        double transit = v.delta + t.din / v.bw;
+        double arrive = t.t + transit;
+        double start = Math.max(arrive, v.freeAt[lane]);         // f_i of Eq. (2): drain-time estimate of the lane
+        v.freeAt[lane] = start + exe;
+        offSum += 2 * v.delta + (t.din + t.dout) / v.bw;
+        energy += v.power * exe + Eval.PTX * (t.din + t.dout) / v.bw;
+        v.busyMI += t.L; v.assigned++; tierCnt[v.tier.ordinal()]++;
+
+        Lane L = lanes[v.id][lane];
+        IFogTaskTuple tp = new IFogTaskTuple(appId, FogUtils.generateTupleId(), Math.max(1L, Math.round(t.L * TS)), i, v.id, lane);
+        tp.setUserId(brokerId);                                   // must equal the module VM's user id
+        tp.setTupleType("TASK");
+        tp.setSrcModuleName("GATEWAY");
+        tp.setDestModuleName(L.module);
+        tp.setDestinationDeviceId(L.dev.getId());
+        tp.setActualTupleId(tp.getCloudletId());
+        tp.listener = x -> CloudSim.send(getId(), getId(), 0.0, TAG_DONE, x);
+        send(getId(), transit * TS, TAG_ARRIVE, tp);
+    }
+
+    /** Task has reached the node: start it now (idle lane or PS) or queue it behind the running task (FIFO). */
+    private void arrive(IFogTaskTuple tp) {
+        Lane L = lanes[tp.nodeId][tp.lane];
+        if (qm == Queue.PS || !L.busy) { L.busy = true; sendNow(L.dev.getId(), FogEvents.TUPLE_ARRIVAL, tp); }
+        else L.queue.addLast(tp);
+    }
+
+    /** iFogSim2 finished executing the tuple: record the response time and release the next queued task. */
+    private void done(IFogTaskTuple tp) {
+        Task t = tasks[tp.taskIdx]; Node v = nodes[tp.nodeId];
+        double back = (tp.doneAt / TS - T0) + v.delta + t.dout / v.bw;   // result returns over the same uplink
+        resp[tp.taskIdx] = back - t.t;
+        lastFinish = Math.max(lastFinish, back);
+        completed++;
+        if (qm == Queue.FIFO) {
+            Lane L = lanes[tp.nodeId][tp.lane];
+            IFogTaskTuple next = L.queue.pollFirst();
+            if (next != null) sendNow(L.dev.getId(), FogEvents.TUPLE_ARRIVAL, next); else L.busy = false;
+        }
+        if (completed == tasks.length) CloudSim.terminateSimulation(CloudSim.clock() + 1.0);
+    }
+}

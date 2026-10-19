@@ -10,7 +10,7 @@ public final class Simulator {
 
     public static final class Result {
         public String sched, topo, wl; public long seed; public int n;
-        public double meanResp, p95Resp, p99Resp, meanOff, dlRate, critDlRate, critMeanResp, critP99,
+        public double meanResp, p95Resp, p99Resp, meanOff, dlRate, critDlRate, gateRate, critMeanResp, critP99,
                       energyPerTask, decisionUs, utilCV, maxUtil, fracEdge, fracReg, fracCloud, meanResp_analytics;
     }
 
@@ -21,7 +21,7 @@ public final class Simulator {
         Random rng = new Random(seed * 31L + kind.ordinal());
 
         int n = tasks.length;
-        double[] resp = new double[n]; boolean[] met = new boolean[n]; boolean[] crit = new boolean[n];
+        double[] resp = new double[n]; boolean[] met = new boolean[n]; boolean[] crit = new boolean[n]; int gated = 0;
         double offSum = 0, energy = 0, lastFinish = 0; long decNs = 0;
         int[] tierCnt = new int[3];
 
@@ -31,8 +31,10 @@ public final class Simulator {
             Node v = s.assign(t, nodes, now, rng, p);
             decNs += System.nanoTime() - t0;
 
-            boolean isCrit = t.u >= p.ucrit;
-            int lane = (s.gate() && isCrit && v.resFrac > 0) ? 1 : 0;
+            boolean isCrit = (t.cls == Task.Cls.HEALTH);   // predefined critical class: independent of u_crit
+            boolean gateOn = t.u >= p.ucrit;               // urgency gate activation (depends on u_crit)
+            if (gateOn) gated++;
+            int lane = (s.gate() && gateOn && v.resFrac > 0) ? 1 : 0;
             double rate = v.rate(lane), exe = t.L / rate;
             double arrive = now + v.delta + t.din / v.bw;
             double start = Math.max(arrive, v.freeAt[lane]);
@@ -50,7 +52,7 @@ public final class Simulator {
         r.meanResp = mean(resp, null); r.p95Resp = pct(resp, null, 0.95); r.p99Resp = pct(resp, null, 0.99);
         r.meanOff = offSum / n; r.energyPerTask = energy / n; r.decisionUs = decNs / 1e3 / n;
         int ok = 0, c = 0, cok = 0; for (int i = 0; i < n; i++) { if (met[i]) ok++; if (crit[i]) { c++; if (met[i]) cok++; } }
-        r.dlRate = (double) ok / n; r.critDlRate = c == 0 ? Double.NaN : (double) cok / c;
+        r.gateRate = (double) gated / n; r.dlRate = (double) ok / n; r.critDlRate = c == 0 ? Double.NaN : (double) cok / c;
         r.critMeanResp = mean(resp, crit); r.critP99 = pct(resp, crit, 0.99);
         boolean[] an = new boolean[n]; for (int i = 0; i < n; i++) an[i] = tasks[i].cls == Task.Cls.ANALYTICS;
         r.meanResp_analytics = mean(resp, an);

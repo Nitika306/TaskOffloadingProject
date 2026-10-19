@@ -7,12 +7,15 @@ import java.util.*;
 import java.util.concurrent.*;
 
 public final class Experiments {
-    static final String HEADER = "scenario,sched,topo,wl,seed,n,meanResp,p95Resp,p99Resp,meanOff,dlRate,critDlRate,critMeanResp,critP99,"
+    /** Seed separation: tuning 9001-9005; sensitivity/WAN 1..n; FINAL EVALUATION 31..30+n (never used for tuning or sensitivity). */
+    static final int EVAL_FIRST = 31, SENS_FIRST = 1;
+
+    static final String HEADER = "scenario,sched,topo,wl,seed,n,meanResp,p95Resp,p99Resp,meanOff,dlRate,critDlRate,gateRate,critMeanResp,critP99,"
         + "energyPerTask,decisionUs,utilCV,maxUtil,fracEdge,fracReg,fracCloud,meanRespAnalytics";
 
     static String row(String scenario, Simulator.Result r) {
-        return String.format(Locale.ROOT, "%s,%s,%s,%s,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.4f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
-            scenario, r.sched, r.topo, r.wl, r.seed, r.n, r.meanResp, r.p95Resp, r.p99Resp, r.meanOff, r.dlRate, r.critDlRate,
+        return String.format(Locale.ROOT, "%s,%s,%s,%s,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.4f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+            scenario, r.sched, r.topo, r.wl, r.seed, r.n, r.meanResp, r.p95Resp, r.p99Resp, r.meanOff, r.dlRate, r.critDlRate, r.gateRate,
             r.critMeanResp, r.critP99, r.energyPerTask, r.decisionUs, r.utilCV, r.maxUtil, r.fracEdge, r.fracReg, r.fracCloud, r.meanResp_analytics);
     }
 
@@ -32,15 +35,16 @@ public final class Experiments {
         ex.shutdown();
     }
 
-    static Node[] topo(String name, double wan) { return name.equals("flat") ? Topology.flat(1) : Topology.tiered(wan, 1); }
+    static Node[] topo(String name, double wan, int scale) { return name.equals("flat") ? Topology.flat(scale) : Topology.tiered(wan, scale); }
 
-    /** Main experiment: all schedulers x 2 topologies x 4 workloads x seeds 1..nSeeds (paired: same tasks for every scheduler). */
-    public static void main_(Path outDir, Params p, int nSeeds) throws Exception {
+    /** Main experiment: all schedulers x 2 topologies x 4 workloads x seeds 31..30+nSeeds (paired: same tasks for every scheduler).
+     *  scale is the topology multiplier (scale=1 is the 8-node default; scale=2 is 15 nodes). */
+    public static void main_(Path outDir, Params p, int nSeeds, int scale) throws Exception {
         List<Job> jobs = new ArrayList<>();
-        for (String tn : new String[]{"tiered", "flat"}) for (Workload wl : Workload.ALL) for (int s = 1; s <= nSeeds; s++) {
+        for (String tn : new String[]{"tiered", "flat"}) for (Workload wl : Workload.ALL) for (int s = EVAL_FIRST; s < EVAL_FIRST + nSeeds; s++) {
             final String t = tn; final Workload w = wl; final long seed = s;
             jobs.add(() -> {
-                Node[] proto = topo(t, Topology.WAN_DEFAULT); Task[] tasks = w.generate(seed);
+                Node[] proto = topo(t, Topology.WAN_DEFAULT, scale); Task[] tasks = w.generate(seed);
                 List<String> rows = new ArrayList<>();
                 for (Kind k : Kind.values()) rows.add(row("main", Simulator.run(proto, tasks, k, p, seed, t, w.name)));
                 return rows;
@@ -54,7 +58,7 @@ public final class Experiments {
         double[] d = {0.02, 0.05, 0.10, 0.20, 0.40};
         Kind[] ks = {Kind.GREEDY, Kind.BASE19, Kind.PROPOSED, Kind.PROPOSED_EXACT, Kind.ABL_GATECLOUD, Kind.ABL_NOGATE};
         List<Job> jobs = new ArrayList<>();
-        for (double wd : d) for (int s = 1; s <= nSeeds; s++) {
+        for (double wd : d) for (int s = SENS_FIRST; s < SENS_FIRST + nSeeds; s++) {
             final double wan = wd; final long seed = s;
             jobs.add(() -> {
                 Node[] proto = Topology.tiered(wan, 1); Task[] tasks = Workload.byName("P60").generate(seed);
@@ -73,7 +77,7 @@ public final class Experiments {
         for (String k : Params.TUNABLE) for (String f : new String[]{"0.5", "1.5"}) variants.add(new String[]{k, f});
         for (String f : new String[]{"0.0", "0.1", "0.2", "0.5"}) variants.add(new String[]{"resFrac", f}); // absolute values
         for (String f : new String[]{"0.6", "0.9"}) variants.add(new String[]{"ucrit", f});               // absolute values
-        for (String[] v : variants) for (String wn : new String[]{"P60", "B60"}) for (int s = 1; s <= nSeeds; s++) {
+        for (String[] v : variants) for (String wn : new String[]{"P60", "B60"}) for (int s = SENS_FIRST; s < SENS_FIRST + nSeeds; s++) {
             final String[] vv = v; final String w = wn; final long seed = s;
             jobs.add(() -> {
                 Params q = p.copy(); String lab = vv[0] + "x" + vv[1];
@@ -114,6 +118,36 @@ public final class Experiments {
             }
         }
         best.save(outDir.resolve("tuned_params.properties"));
+        return best;
+    }
+
+    /** Jointly tune the reserved fraction eta (resFrac) and the urgency threshold ucrit on seeds disjoint from both
+     *  the final-evaluation seeds (31..) and the sensitivity seeds (1..30). Returns a Params copy with resFrac and
+     *  ucrit set to the best grid point, and writes tuned_gate_params.properties + tune_gate_log.csv. */
+    public static Params tuneGate(Path outDir, Params base, int scale) throws Exception {
+        double[] resFracs = {0.1, 0.2, 0.3, 0.5};
+        double[] ucrits = {0.6, 0.8, 0.9};
+        long[] seeds = {9006, 9007, 9008, 9009, 9010};
+        String[] wls = {"P60", "B60"};
+        double bestJ = Double.POSITIVE_INFINITY; double bestRf = 0.3, bestU = 0.8;
+        Node[] proto = Topology.tiered(Topology.WAN_DEFAULT, scale);
+        try (BufferedWriter w = Files.newBufferedWriter(outDir.resolve("tune_gate_log.csv"))) {
+            w.write("resFrac,ucrit,J"); w.newLine();
+            for (double rf : resFracs) for (double u : ucrits) {
+                double J = 0; int cnt = 0;
+                for (String wl : wls) for (long seed : seeds) {
+                    Task[] tasks = Workload.byName(wl).generate(seed);
+                    Params q = base.copy(); q.resFrac = rf; q.ucrit = u;
+                    Simulator.Result r = Simulator.run(proto, tasks, Kind.PROPOSED, q, seed, "tiered", wl);
+                    J += (1 - r.dlRate) + (1 - r.critDlRate) + 0.05 * r.meanResp; cnt++;
+                }
+                J /= cnt;
+                w.write(String.format(Locale.ROOT, "%.2f,%.1f,%.6f%n", rf, u, J));
+                if (J < bestJ) { bestJ = J; bestRf = rf; bestU = u; System.out.printf(Locale.ROOT, "  gate tune rf=%.2f u=%.1f J=%.6f%n", rf, u, J); }
+            }
+        }
+        Params best = base.copy(); best.resFrac = bestRf; best.ucrit = bestU;
+        best.save(outDir.resolve("tuned_gate_params.properties"));
         return best;
     }
 
